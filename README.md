@@ -77,12 +77,24 @@ GET /api/repositories
 curl "http://localhost:5000/api/repositories?limit=10&languages=Python,JavaScript"
 ```
 
+### Get Pinned Repositories
+```
+GET /api/pinned
+```
+
+Returns your pinned repositories - the ones you've specifically chosen to showcase on your GitHub profile. **This is the best endpoint for portfolio websites!**
+
+**Example:**
+```bash
+curl "http://localhost:5000/api/pinned"
+```
+
 ### Get Featured Repositories
 ```
 GET /api/featured
 ```
 
-Returns top repositories optimized for website display.
+Returns top repositories optimized for website display (based on stars and activity).
 
 **Query Parameters:**
 - `limit` (integer): Number of featured repositories (default: 6)

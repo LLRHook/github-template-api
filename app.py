@@ -115,6 +115,182 @@ class GitHubService:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching languages for {repo_name}: {str(e)}")
             return {}
+    
+    def get_repository_readme(self, repo_name):
+        """Get README content for a specific repository"""
+        try:
+            url = f"{GITHUB_API_BASE}/repos/{self.username}/{repo_name}/readme"
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            readme_data = response.json()
+            
+            # Decode README content from base64
+            if 'content' in readme_data:
+                import base64
+                content_base64 = readme_data['content']
+                readme_content = base64.b64decode(content_base64).decode('utf-8')
+                
+                # Log the README content
+                logger.info(f"README content for {repo_name}:")
+                logger.info("="*60)
+                logger.info(readme_content)
+                logger.info("="*60)
+                
+                return {
+                    'path': readme_data.get('path'),
+                    'size': readme_data.get('size'),
+                    'content': readme_content,
+                    'download_url': readme_data.get('download_url')
+                }
+            else:
+                logger.warning(f"No content found in README for {repo_name}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching README for {repo_name}: {str(e)}")
+            return None
+    
+    def get_pinned_repositories(self):
+        """Get pinned repositories using GitHub GraphQL API"""
+        try:
+            # GraphQL endpoint
+            graphql_url = "https://api.github.com/graphql"
+            
+            # GraphQL query for pinned repositories
+            query = """
+            query($username: String!) {
+                user(login: $username) {
+                    pinnedItems(first: 6, types: [REPOSITORY]) {
+                        totalCount
+                        edges {
+                            node {
+                                ... on Repository {
+                                    id
+                                    name
+                                    nameWithOwner
+                                    description
+                                    url
+                                    homepageUrl
+                                    stargazerCount
+                                    forkCount
+                                    isPrivate
+                                    isFork
+                                    isArchived
+                                    createdAt
+                                    updatedAt
+                                    pushedAt
+                                    primaryLanguage {
+                                        name
+                                        color
+                                    }
+                                    languages(first: 5, orderBy: {field: SIZE, direction: DESC}) {
+                                        edges {
+                                            node {
+                                                name
+                                            }
+                                            size
+                                        }
+                                    }
+                                    repositoryTopics(first: 10) {
+                                        edges {
+                                            node {
+                                                topic {
+                                                    name
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            """
+            
+            # GraphQL headers (need different auth format)
+            graphql_headers = {
+                'Authorization': f'Bearer {self.token}',
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+            
+            # Make GraphQL request
+            response = requests.post(
+                graphql_url,
+                json={
+                    'query': query,
+                    'variables': {'username': self.username}
+                },
+                headers=graphql_headers
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            if 'errors' in data:
+                logger.error(f"GraphQL errors: {data['errors']}")
+                # Check for common permission errors
+                for error in data['errors']:
+                    if 'insufficient' in error.get('message', '').lower() or 'forbidden' in error.get('message', '').lower():
+                        logger.error("Token permissions issue: Your GitHub token may need additional scopes.")
+                        logger.error("Required scopes: public_repo, read:user")
+                        logger.error("Visit: https://github.com/settings/tokens to update your token")
+                return []
+            
+            # Extract pinned repositories from GraphQL response
+            pinned_repos = []
+            pinned_items = data.get('data', {}).get('user', {}).get('pinnedItems', {})
+            
+            logger.info(f"Found {pinned_items.get('totalCount', 0)} pinned repositories")
+            
+            for edge in pinned_items.get('edges', []):
+                repo = edge['node']
+                
+                # Extract topics
+                topics = []
+                for topic_edge in repo.get('repositoryTopics', {}).get('edges', []):
+                    topics.append(topic_edge['node']['topic']['name'])
+                
+                # Extract languages
+                languages = {}
+                for lang_edge in repo.get('languages', {}).get('edges', []):
+                    languages[lang_edge['node']['name']] = lang_edge['size']
+                
+                # Format repository data
+                repo_data = {
+                    'id': repo['id'],
+                    'name': repo['name'],
+                    'full_name': repo['nameWithOwner'],
+                    'description': repo.get('description', ''),
+                    'url': repo['url'],
+                    'homepage': repo.get('homepageUrl'),
+                    'language': repo.get('primaryLanguage', {}).get('name') if repo.get('primaryLanguage') else None,
+                    'language_color': repo.get('primaryLanguage', {}).get('color') if repo.get('primaryLanguage') else None,
+                    'stars': repo['stargazerCount'],
+                    'forks': repo['forkCount'],
+                    'created_at': repo['createdAt'],
+                    'updated_at': repo['updatedAt'],
+                    'pushed_at': repo['pushedAt'],
+                    'topics': topics,
+                    'languages': languages,
+                    'is_private': repo['isPrivate'],
+                    'is_fork': repo['isFork'],
+                    'archived': repo['isArchived'],
+                    'is_pinned': True  # Mark as pinned
+                }
+                
+                pinned_repos.append(repo_data)
+            
+            return pinned_repos
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching pinned repositories: {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error fetching pinned repositories: {str(e)}")
+            return []
 
 # Initialize GitHub service
 github_service = None
@@ -214,6 +390,78 @@ def get_repository_languages(repo_name):
         })
     except Exception as e:
         logger.error(f"Error getting languages for {repo_name}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/repositories/<repo_name>/readme', methods=['GET'])
+def get_repository_readme(repo_name):
+    """Get README content for a specific repository"""
+    
+    if not github_service:
+        return jsonify({
+            'error': 'GitHub service not configured'
+        }), 500
+    
+    try:
+        readme_data = github_service.get_repository_readme(repo_name)
+        
+        if readme_data:
+            # README content is already logged in the service method
+            return jsonify({
+                'repository': repo_name,
+                'readme': readme_data
+            })
+        else:
+            return jsonify({
+                'repository': repo_name,
+                'readme': None,
+                'message': 'README not found or not accessible'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Error getting README for {repo_name}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pinned', methods=['GET'])
+def get_pinned_repositories():
+    """
+    Get pinned repositories - the ones you've specifically chosen to showcase
+    This endpoint is perfect for website portfolio sections
+    """
+    
+    if not github_service:
+        return jsonify({
+            'error': 'GitHub service not configured'
+        }), 500
+    
+    try:
+        # Get pinned repositories using GraphQL
+        pinned_repos = github_service.get_pinned_repositories()
+        
+        # Format for website display
+        formatted_repos = []
+        for repo in pinned_repos:
+            formatted_repos.append({
+                'name': repo['name'],
+                'description': repo['description'] or 'No description available',
+                'url': repo['url'],
+                'homepage': repo['homepage'],
+                'language': repo['language'],
+                'language_color': repo['language_color'],
+                'stars': repo['stars'],
+                'forks': repo['forks'],
+                'topics': repo['topics'],
+                'languages': repo['languages'],
+                'last_updated': repo['updated_at'],
+                'is_pinned': True
+            })
+        
+        return jsonify({
+            'pinned_repositories': formatted_repos,
+            'count': len(formatted_repos)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_pinned_repositories: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/featured', methods=['GET'])
