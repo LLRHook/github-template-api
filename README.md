@@ -125,7 +125,8 @@ Errors use a JSON object with an `error` field:
   `repository`, `readme: null`, and `message` response fields.
 - `502`: GitHub returned an HTTP, GraphQL, or invalid JSON/content error, or the
   connection failed. Upstream errors are not returned as successful empty results.
-- `504`: A request to GitHub timed out.
+- `504`: A request to GitHub timed out, including while reading the response body
+  after receiving headers.
 
 Each GitHub request uses a 3.05-second connection timeout and a 10-second read
 timeout. These apply to each network request, including each repository page;

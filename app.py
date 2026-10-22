@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from urllib3.exceptions import ReadTimeoutError
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -65,6 +66,12 @@ class GitHubService:
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
                 raise GitHubAPIError('GitHub resource not found', 404) from exc
+            raise GitHubAPIError('GitHub API request failed') from exc
+        except requests.exceptions.ConnectionError as exc:
+            # Requests 2.31 wraps response-body read timeouts in ConnectionError.
+            # Match the transport exception type, never its potentially misleading text.
+            if any(isinstance(reason, ReadTimeoutError) for reason in exc.args):
+                raise GitHubAPIError('GitHub request timed out', 504) from exc
             raise GitHubAPIError('GitHub API request failed') from exc
         except (requests.exceptions.RequestException, ValueError) as exc:
             raise GitHubAPIError('GitHub API request failed') from exc

@@ -2,11 +2,15 @@
 
 import base64
 import json
+import socket
 import unittest
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Event, Thread
 from unittest.mock import patch
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 import app as api
 
@@ -249,10 +253,12 @@ class GitHubResponseTests(APITestCase):
                     self.assertNotIn('private detail', response.get_data(as_text=True))
 
     def test_connection_errors_are_gateway_errors(self):
-        self.get.side_effect = requests.exceptions.ConnectionError('private detail')
-        response = self.client.get('/api/repositories/example/languages')
-        self.assertEqual(response.status_code, 502)
-        self.assertNotIn('private detail', response.get_data(as_text=True))
+        for detail in ('private detail', 'Read timed out', 'ReadTimeoutError'):
+            with self.subTest(detail=detail):
+                self.get.side_effect = requests.exceptions.ConnectionError(detail)
+                response = self.client.get('/api/repositories/example/languages')
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.get_json(), {'error': 'GitHub API request failed'})
 
     def test_readme_not_found_preserves_existing_response(self):
         self.get.return_value = github_response({'message': 'Not Found'}, 404)
@@ -351,6 +357,88 @@ class GitHubResponseTests(APITestCase):
         response = self.client.get('/api/repositories/example/languages')
         self.assertEqual(response.status_code, 502)
         self.assertIn('error', response.get_json())
+
+
+class GitHubTransportTests(APITestCase):
+    """Exercise Requests' real exception wrapping using only a local HTTP server."""
+
+    endpoints = (
+        '/api/repositories', '/api/featured', '/api/pinned',
+        '/api/repositories/example/languages', '/api/repositories/example/readme',
+    )
+
+    def setUp(self):
+        super().setUp()
+        release_body = Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith('/disconnect'):
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', '1000')
+                self.end_headers()
+                self.wfile.write(b'{"private":"detail",')
+                self.wfile.flush()
+                # Headers and a partial body arrive; only the remaining body stalls.
+                release_body.wait(5)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                self.do_GET()
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+
+        def stop_server():
+            release_body.set()
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+        self.addCleanup(stop_server)
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.addCleanup(self.session.close)
+        self.upstream = f'http://127.0.0.1:{server.server_port}'
+        self.upstream_path = '/stall'
+        self.get.side_effect = lambda url, **kwargs: self.session.get(
+            self.upstream + self.upstream_path, **kwargs
+        )
+        self.post.side_effect = lambda url, **kwargs: self.session.post(
+            self.upstream + self.upstream_path, **kwargs
+        )
+        timeout_patch = patch.object(api, 'GITHUB_REQUEST_TIMEOUT', (1, 0.1))
+        timeout_patch.start()
+        self.addCleanup(timeout_patch.stop)
+
+    def test_requests_wraps_body_timeout_in_connection_error(self):
+        with self.assertRaises(requests.exceptions.ConnectionError) as caught:
+            self.session.get(self.upstream + '/stall', timeout=(1, 0.1))
+        self.assertNotIsInstance(caught.exception, requests.exceptions.Timeout)
+        self.assertIsInstance(caught.exception.args[0], ReadTimeoutError)
+
+    def test_body_read_timeouts_return_sanitized_504_on_every_endpoint(self):
+        for endpoint in self.endpoints:
+            with self.subTest(endpoint=endpoint):
+                response = self.client.get(endpoint)
+                self.assertEqual(response.status_code, 504)
+                self.assertEqual(response.get_json(), {'error': 'GitHub request timed out'})
+
+    def test_real_disconnects_remain_sanitized_502_on_every_endpoint(self):
+        self.upstream_path = '/disconnect'
+        for endpoint in self.endpoints:
+            with self.subTest(endpoint=endpoint):
+                response = self.client.get(endpoint)
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(response.get_json(), {'error': 'GitHub API request failed'})
 
 
 if __name__ == '__main__':
