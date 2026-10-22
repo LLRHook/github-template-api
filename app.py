@@ -1,10 +1,12 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
+from urllib3.exceptions import ReadTimeoutError
 import os
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import logging
+from threading import Lock
 
 # Load environment variables
 load_dotenv()
@@ -21,13 +23,25 @@ logger = logging.getLogger(__name__)
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_USERNAME = os.getenv('GITHUB_USERNAME')
 GITHUB_API_BASE = 'https://api.github.com'
+GITHUB_REQUEST_TIMEOUT = (3.05, 10)
 
 # Cache for storing repo data (in production, use Redis or similar)
 repo_cache = {
     'data': None,
     'last_updated': None,
+    'key': None,
     'cache_duration': timedelta(minutes=30)  # Cache for 30 minutes
 }
+repo_cache_lock = Lock()
+
+
+class GitHubAPIError(Exception):
+    """An upstream failure with a safe, client-facing message."""
+
+    def __init__(self, message, status_code=502):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class GitHubService:
     """Service class for GitHub API interactions"""
@@ -40,6 +54,31 @@ class GitHubService:
             'Accept': 'application/vnd.github.v3+json',
             'User-Agent': 'GitHub-Template-API'
         }
+
+    def _request_json(self, method, url, expected_type=dict, **kwargs):
+        """Bound network waits and preserve failures instead of returning empty data."""
+        try:
+            response = method(url, timeout=GITHUB_REQUEST_TIMEOUT, **kwargs)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.Timeout as exc:
+            raise GitHubAPIError('GitHub request timed out', 504) from exc
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                raise GitHubAPIError('GitHub resource not found', 404) from exc
+            raise GitHubAPIError('GitHub API request failed') from exc
+        except requests.exceptions.ConnectionError as exc:
+            # Requests 2.31 wraps response-body read timeouts in ConnectionError.
+            # Match the transport exception type, never its potentially misleading text.
+            if any(isinstance(reason, ReadTimeoutError) for reason in exc.args):
+                raise GitHubAPIError('GitHub request timed out', 504) from exc
+            raise GitHubAPIError('GitHub API request failed') from exc
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            raise GitHubAPIError('GitHub API request failed') from exc
+
+        if not isinstance(data, expected_type):
+            raise GitHubAPIError('Invalid response from GitHub')
+        return response, data
     
     def fetch_repositories(self, filter_forks=True, filter_languages=None, sort='updated'):
         """
@@ -50,31 +89,29 @@ class GitHubService:
             filter_languages (list): Filter by programming languages
             sort (str): Sort order ('updated', 'created', 'pushed', 'full_name')
         """
-        try:
-            url = f"{GITHUB_API_BASE}/users/{self.username}/repos"
-            params = {
-                'type': 'owner',
-                'sort': sort,
-                'direction': 'desc',
-                'per_page': 100
-            }
-            
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            
-            repos = response.json()
-            
-            # Filter repositories
-            filtered_repos = []
+        url = f"{GITHUB_API_BASE}/users/{self.username}/repos"
+        params = {
+            'type': 'owner',
+            'sort': sort,
+            'direction': 'desc',
+            'per_page': 100,
+            'page': 1,
+        }
+        languages = {lang.strip().lower() for lang in filter_languages or [] if lang.strip()}
+        filtered_repos = []
+        while True:
+            response, repos = self._request_json(
+                requests.get, url, expected_type=list, headers=self.headers, params=params.copy()
+            )
             for repo in repos:
                 # Skip forks if requested
                 if filter_forks and repo.get('fork', False):
                     continue
                 
                 # Filter by languages if specified
-                if filter_languages:
-                    repo_language = repo.get('language', '').lower()
-                    if repo_language not in [lang.lower() for lang in filter_languages]:
+                if languages:
+                    repo_language = (repo.get('language') or '').lower()
+                    if repo_language not in languages:
                         continue
                 
                 # Extract relevant information
@@ -99,43 +136,34 @@ class GitHubService:
                 
                 filtered_repos.append(repo_data)
             
-            return filtered_repos
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching repositories: {str(e)}")
-            raise Exception(f"Failed to fetch repositories: {str(e)}")
+            if 'next' not in response.links:
+                break
+            # Keep credentials on the configured GitHub endpoint, even if a Link URL is unexpected.
+            params['page'] += 1
+        return filtered_repos
     
     def get_repository_languages(self, repo_name):
         """Get programming languages used in a specific repository"""
-        try:
-            url = f"{GITHUB_API_BASE}/repos/{self.username}/{repo_name}/languages"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching languages for {repo_name}: {str(e)}")
-            return {}
+        url = f"{GITHUB_API_BASE}/repos/{self.username}/{repo_name}/languages"
+        _, languages = self._request_json(requests.get, url, headers=self.headers)
+        return languages
     
     def get_repository_readme(self, repo_name):
         """Get README content for a specific repository"""
         try:
             url = f"{GITHUB_API_BASE}/repos/{self.username}/{repo_name}/readme"
-            response = requests.get(url, headers=self.headers)
-            response.raise_for_status()
-            
-            readme_data = response.json()
+            _, readme_data = self._request_json(requests.get, url, headers=self.headers)
             
             # Decode README content from base64
             if 'content' in readme_data:
                 import base64
                 content_base64 = readme_data['content']
-                readme_content = base64.b64decode(content_base64).decode('utf-8')
-                
-                # Log the README content
-                logger.info(f"README content for {repo_name}:")
-                logger.info("="*60)
-                logger.info(readme_content)
-                logger.info("="*60)
+                if not isinstance(content_base64, str):
+                    raise GitHubAPIError('Invalid README content from GitHub')
+                # GitHub wraps base64 content with newlines; reject other invalid bytes.
+                readme_content = base64.b64decode(
+                    ''.join(content_base64.split()), validate=True
+                ).decode('utf-8')
                 
                 return {
                     'path': readme_data.get('path'),
@@ -147,9 +175,12 @@ class GitHubService:
                 logger.warning(f"No content found in README for {repo_name}")
                 return None
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching README for {repo_name}: {str(e)}")
-            return None
+        except GitHubAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        except (ValueError, TypeError) as exc:
+            raise GitHubAPIError('Invalid README content from GitHub') from exc
     
     def get_pinned_repositories(self):
         """Get pinned repositories using GitHub GraphQL API"""
@@ -217,7 +248,8 @@ class GitHubService:
             }
             
             # Make GraphQL request
-            response = requests.post(
+            _, data = self._request_json(
+                requests.post,
                 graphql_url,
                 json={
                     'query': query,
@@ -225,23 +257,12 @@ class GitHubService:
                 },
                 headers=graphql_headers
             )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if 'errors' in data:
-                logger.error(f"GraphQL errors: {data['errors']}")
-                # Check for common permission errors
-                for error in data['errors']:
-                    if 'insufficient' in error.get('message', '').lower() or 'forbidden' in error.get('message', '').lower():
-                        logger.error("Token permissions issue: Your GitHub token may need additional scopes.")
-                        logger.error("Required scopes: public_repo, read:user")
-                        logger.error("Visit: https://github.com/settings/tokens to update your token")
-                return []
+            if data.get('errors'):
+                raise GitHubAPIError('GitHub GraphQL request failed')
             
             # Extract pinned repositories from GraphQL response
             pinned_repos = []
-            pinned_items = data.get('data', {}).get('user', {}).get('pinnedItems', {})
+            pinned_items = data['data']['user']['pinnedItems']
             
             logger.info(f"Found {pinned_items.get('totalCount', 0)} pinned repositories")
             
@@ -285,25 +306,41 @@ class GitHubService:
             
             return pinned_repos
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching pinned repositories: {str(e)}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error fetching pinned repositories: {str(e)}")
-            return []
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise GitHubAPIError('Invalid response from GitHub') from exc
 
 # Initialize GitHub service
 github_service = None
 if GITHUB_TOKEN and GITHUB_USERNAME:
     github_service = GitHubService(GITHUB_TOKEN, GITHUB_USERNAME)
 
-def is_cache_valid():
+def is_cache_valid(cache_key):
     """Check if cached data is still valid"""
-    if not repo_cache['data'] or not repo_cache['last_updated']:
+    if (repo_cache['data'] is None or repo_cache['last_updated'] is None
+            or repo_cache['key'] != cache_key):
         return False
     
     time_since_update = datetime.now() - repo_cache['last_updated']
     return time_since_update < repo_cache['cache_duration']
+
+
+def parse_boolean_query(name):
+    value = request.args.get(name, 'false').strip().lower()
+    if value not in ('true', 'false'):
+        raise ValueError(f'{name} must be true or false')
+    return value == 'true'
+
+
+def parse_limit(default=None):
+    if 'limit' not in request.args:
+        return default
+    try:
+        limit = int(request.args['limit'])
+    except ValueError:
+        raise ValueError('limit must be a positive integer') from None
+    if limit <= 0:
+        raise ValueError('limit must be a positive integer')
+    return limit
 
 @app.route('/')
 def health_check():
@@ -335,16 +372,27 @@ def get_repositories():
     
     try:
         # Get query parameters
-        include_forks = request.args.get('include_forks', 'false').lower() == 'true'
-        languages = request.args.get('languages', '').split(',') if request.args.get('languages') else None
+        include_forks = parse_boolean_query('include_forks')
+        languages = tuple(sorted({
+            lang.strip().lower() for lang in request.args.get('languages', '').split(',')
+            if lang.strip()
+        }))
         sort = request.args.get('sort', 'updated')
-        limit = request.args.get('limit', type=int)
-        force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
+        if sort not in ('updated', 'created', 'pushed', 'full_name'):
+            raise ValueError('sort must be updated, created, pushed, or full_name')
+        limit = parse_limit()
+        force_refresh = parse_boolean_query('force_refresh')
+        cache_key = (include_forks, languages, sort)
         
         # Check cache first (unless force refresh is requested)
-        if not force_refresh and is_cache_valid():
+        with repo_cache_lock:
+            cache_hit = not force_refresh and is_cache_valid(cache_key)
+            if cache_hit:
+                repos = repo_cache['data']
+                last_updated = repo_cache['last_updated']
+
+        if cache_hit:
             logger.info("Returning cached repository data")
-            repos = repo_cache['data']
         else:
             # Fetch fresh data from GitHub
             logger.info("Fetching fresh repository data from GitHub")
@@ -355,20 +403,24 @@ def get_repositories():
             )
             
             # Update cache
-            repo_cache['data'] = repos
-            repo_cache['last_updated'] = datetime.now()
+            last_updated = datetime.now()
+            with repo_cache_lock:
+                repo_cache.update(data=repos, last_updated=last_updated, key=cache_key)
         
         # Apply limit if specified
-        if limit and limit > 0:
+        if limit is not None:
             repos = repos[:limit]
         
         return jsonify({
             'repositories': repos,
             'count': len(repos),
-            'cached': not force_refresh and is_cache_valid(),
-            'last_updated': repo_cache['last_updated'].isoformat() if repo_cache['last_updated'] else None
+            'cached': cache_hit,
+            'last_updated': last_updated.isoformat()
         })
-        
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except GitHubAPIError as e:
+        return jsonify({'error': str(e)}), e.status_code
     except Exception as e:
         logger.error(f"Error in get_repositories: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -388,6 +440,8 @@ def get_repository_languages(repo_name):
             'repository': repo_name,
             'languages': languages
         })
+    except GitHubAPIError as e:
+        return jsonify({'error': str(e)}), e.status_code
     except Exception as e:
         logger.error(f"Error getting languages for {repo_name}: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -405,7 +459,6 @@ def get_repository_readme(repo_name):
         readme_data = github_service.get_repository_readme(repo_name)
         
         if readme_data:
-            # README content is already logged in the service method
             return jsonify({
                 'repository': repo_name,
                 'readme': readme_data
@@ -417,6 +470,8 @@ def get_repository_readme(repo_name):
                 'message': 'README not found or not accessible'
             }), 404
             
+    except GitHubAPIError as e:
+        return jsonify({'error': str(e)}), e.status_code
     except Exception as e:
         logger.error(f"Error getting README for {repo_name}: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -460,6 +515,8 @@ def get_pinned_repositories():
             'count': len(formatted_repos)
         })
         
+    except GitHubAPIError as e:
+        return jsonify({'error': str(e)}), e.status_code
     except Exception as e:
         logger.error(f"Error in get_pinned_repositories: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -478,7 +535,7 @@ def get_featured_repositories():
     
     try:
         # Get query parameters
-        limit = request.args.get('limit', 6, type=int)  # Default to 6 for website display
+        limit = parse_limit(default=6)
         
         # Get all repositories
         repos = github_service.fetch_repositories(filter_forks=True, sort='updated')
@@ -508,6 +565,10 @@ def get_featured_repositories():
             'count': len(formatted_repos)
         })
         
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except GitHubAPIError as e:
+        return jsonify({'error': str(e)}), e.status_code
     except Exception as e:
         logger.error(f"Error in get_featured_repositories: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -524,4 +585,4 @@ if __name__ == '__main__':
         host='0.0.0.0',
         port=int(os.getenv('PORT', 5001)),
         debug=os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
-    ) 
+    )
