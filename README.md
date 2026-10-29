@@ -69,13 +69,17 @@ GET /api/repositories
 - `include_forks` (boolean): Include forked repositories (default: false)
 - `languages` (string): Comma-separated list of languages to filter by
 - `sort` (string): Sort order - `updated`, `created`, `pushed`, `full_name` (default: updated)
-- `limit` (integer): Maximum number of repositories to return
+- `limit` (positive integer): Maximum number of repositories to return
 - `force_refresh` (boolean): Force refresh of cached data (default: false)
 
 **Example:**
 ```bash
 curl "http://localhost:5000/api/repositories?limit=10&languages=Python,JavaScript"
 ```
+
+Language filters ignore case, surrounding whitespace, and empty comma-separated entries.
+Repository results include all GitHub pages before applying filters and the optional limit.
+The `cached` response field is `true` only when that request was served from the cache.
 
 ### Get Pinned Repositories
 ```
@@ -97,7 +101,7 @@ GET /api/featured
 Returns top repositories optimized for website display (based on stars and activity).
 
 **Query Parameters:**
-- `limit` (integer): Number of featured repositories (default: 6)
+- `limit` (positive integer): Number of featured repositories (default: 6)
 
 **Example:**
 ```bash
@@ -110,6 +114,23 @@ GET /api/repositories/{repo_name}/languages
 ```
 
 Returns programming languages used in a specific repository.
+
+### Error Responses
+
+Errors use a JSON object with an `error` field:
+
+- `400`: Invalid `limit`, `sort`, or boolean query parameter. Boolean parameters accept
+  `true` and `false`, case-insensitively. Invalid requests do not call GitHub.
+- `404`: GitHub could not find the requested resource. A missing README retains the
+  `repository`, `readme: null`, and `message` response fields.
+- `502`: GitHub returned an HTTP, GraphQL, or invalid JSON/content error, or the
+  connection failed. Upstream errors are not returned as successful empty results.
+- `504`: A request to GitHub timed out, including while reading the response body
+  after receiving headers.
+
+Each GitHub request uses a 3.05-second connection timeout and a 10-second read
+timeout. These apply to each network request, including each repository page;
+the read timeout measures inactivity rather than the total response duration.
 
 ## 📋 Response Format
 
@@ -240,8 +261,24 @@ function FeaturedProjects() {
 
 The API includes built-in caching to avoid hitting GitHub's rate limits:
 - Cache duration: 30 minutes
+- The cache holds one query result, keyed by fork inclusion, normalized language
+  filters, and sort order. A different query replaces the entry; limits are applied
+  after reading the cached result. Empty results are cached too.
 - Force refresh: Use `force_refresh=true` parameter
+- Failed refreshes leave the last successful cache entry intact
 - In production: Consider using Redis for distributed caching
+
+## Testing
+
+Run the offline regression suite after installing `requirements.txt`:
+
+```bash
+python -m unittest discover -v
+```
+
+The tests use Flask's test client and mock GitHub HTTP responses. They require no
+GitHub credentials or running server. `test_github_api.py` remains an optional
+interactive integration script for checking a configured live service.
 
 ## 🚀 Deployment
 
@@ -300,4 +337,4 @@ The API includes caching to help manage rate limits effectively.
 
 ## 📄 License
 
-This project is licensed under the MIT License. 
+This project is licensed under the MIT License.
